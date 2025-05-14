@@ -1,5 +1,5 @@
 
-r = 4;
+r = 3;
 r_b =r;
 amp = 1;
 
@@ -11,11 +11,11 @@ amp = 1;
 % B =  [1  0 ; 1  0 ; 0  1 ; 0  1];
 
 
-alpha = 0.04;   % thermal diffusivity
-    n = 30;         % number of spatial interior points
-    dt = 0.01;     % time step
+alpha = 0.001;   % thermal diffusivity
+    n = 100;         % number of spatial interior points
+    dt = 0.001;     % time step
     m = 5;          % number of input points
-    T = 1.0;        % total simulation time
+    T = 100.0;        % total simulation time
 
     % Get system matrices
     [A, B] = heat1d_discrete(alpha, n, dt, m);
@@ -26,7 +26,7 @@ D = zeros(1,m);
 n = size(A,1);
 m = size(B,2); % Input Order
 
-rho = 0.5; % Uncertainty bound
+rho = 1; % Uncertainty bound
 
 epsilon = 10e-8;
 yalmip('clear')
@@ -42,7 +42,7 @@ block_matrix = [sqrtm(Q_bar)*Q_delta*sqrtm(Q_bar) + Q_bar^2, EQ;
                 EQ', eye(m)];
 constraints = [constraints, block_matrix >= 0];
 % Solve optimization
-options = sdpsettings('solver', 'mosek', 'verbose', 0);
+options = sdpsettings('solver', 'mosek', 'verbose', 1, 'mosek.MSK_DPAR_INTPNT_CO_TOL_PFEAS', 1e-2);
 optimize(constraints, -trace(Q_delta), options); % Maximize tr(QΔ)
 beta_star = value(trace(Q_delta));
 Q_delta_opt = value(Q_delta);
@@ -60,7 +60,13 @@ constraints = [Z1_D - epsilon*eye(r)>= 0, P1_D - epsilon*eye(n) >= 0, Psi<= -eps
 constraints = [constraints, P1_D - Z_D >= epsilon*eye(n)];
 constraints = [constraints, trace(C*(P1_D - Z_D)*C') <= gam, gam >= 0];
 % Solve optimization
-options = sdpsettings('solver', 'mosek', 'verbose', 1, 'mosek.MSK_DPAR_INTPNT_CO_TOL_PFEAS', 1e-10);
+options = sdpsettings('solver', 'mosek', 'verbose', 0, ...
+    'debug', 1, ...
+    'mosek.MSK_DPAR_INTPNT_TOL_REL_GAP', 1e-1, ...
+    'mosek.MSK_DPAR_INTPNT_TOL_PFEAS', 1e-1, ...
+    'mosek.MSK_DPAR_INTPNT_TOL_DFEAS', 1e-1, ...
+    'mosek.MSK_DPAR_INTPNT_CO_TOL_REL_GAP', 1e-1, ...
+    'mosek.MSK_IPAR_INTPNT_MAX_ITERATIONS', 2);
 optimize(constraints, gam, options);
 P1_D = value(P1_D);
 Z_D = value(Z_D);
@@ -83,17 +89,39 @@ yalmip('clear')
 toc
 %% Comparsion Balanced Truncation
 tic
-sys = ss(A,  B, C, D, 1);  % '1' indicates discrete-time system
-sysr = balred(sys, r_b);   % r is the desired reduced order
+%% Comparsion Balanced Truncation
 
-Ar = sysr.A;
-Br = sysr.B;
-Cr = sysr.C;
-Dr = sysr.D;
+% Compute Gramians
+X = dlyap(A, B*Q_bar*B') + 10e-5 * eye(n);    % Controllability Gramian
+Y = dlyap(A', C'*C) + 10e-5 * eye(n);     % Observability Gramian
 
-tilde_A = Ar;
-tilde_B = Br;
-tilde_C = Cr;
+% Cholesky factorization
+R = chol(X, 'lower');     % X = R*R'
+L = chol(Y, 'lower');     % Y = L*L'
+
+% Compute SVD of L'*R
+[U, S, V] = svd(L' * R);
+HSV = diag(S);            % Hankel Singular Values
+
+
+% Partition singular values/vectors
+U1 = U(:, 1:r_b);
+S1 = S(1:r_b, 1:r_b);
+V1 = V(:, 1:r_b);
+
+% Balancing transformation
+T = R * V1 * diag(1./sqrt(diag(S1)));
+Tinv = diag(1./sqrt(diag(S1))) * U1' * L';
+
+% Transform to balanced coordinates
+A_bal = Tinv * A * T;
+B_bal = Tinv * B;
+C_bal = C * T;
+
+% Truncate to keep dominant states
+tilde_A = A_bal(1:r_b, 1:r_b);
+tilde_B = B_bal(1:r_b, :);
+tilde_C = C_bal(:, 1:r_b);
 
 toc
 % Or use reduce directly (more modern):
@@ -112,12 +140,13 @@ x = zeros(n,T);
 u = zeros(m,T);
 hat_x = zeros(r,T);
 mu = zeros(m,1);  % 均值向量
-Sigma =  amp * eye(m);  % 协方差矩阵
+Sigma =  amp * eye(m) + diag([1, zeros(1,m-1)]);  % 协方差矩阵
 tilde_y = zeros(1,T);
 tilde_x = zeros(r,T);
 
 tilde2_y = zeros(1,T);
 tilde2_x = zeros(r,T);
+
 
 for k = 1: T-1
 %u(:,k) = mvnrnd(mu, Sigma)';
@@ -134,6 +163,7 @@ ut = mvnrnd(mu, Sigma)';
     e2(k) = norm(y(k)- tilde_y(k));
     e3(k) = norm(y(k)- tilde2_y(k));
 end
+
 figure
 plot(y)
 hold on
